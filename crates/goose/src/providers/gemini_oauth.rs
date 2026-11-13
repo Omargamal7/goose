@@ -91,6 +91,7 @@ const OAUTH_TIMEOUT_SECS: u64 = 300;
 const HTML_AUTO_CLOSE_TIMEOUT_MS: u64 = 2000;
 
 const GEMINI_OAUTH_PROVIDER_NAME: &str = "gemini_oauth";
+const FREE_TIER_ID: &str = "free-tier";
 
 // Models available through the Code Assist API
 const GEMINI_OAUTH_KNOWN_MODELS: &[&str] = &[
@@ -308,6 +309,7 @@ struct LoadCodeAssistResponse {
     current_tier: Option<TierInfo>,
     onboard_tiers: Option<Vec<TierInfo>>,
     allowed_tiers: Option<Vec<TierInfo>>,
+    ineligible_tiers: Option<Vec<IneligibleTier>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -316,6 +318,12 @@ struct TierInfo {
     id: Option<String>,
     #[serde(default)]
     is_default: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct IneligibleTier {
+    reason_message: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -393,39 +401,120 @@ async fn code_assist_get(access_token: &str, path: &str) -> Result<Value> {
     Ok(resp.json().await?)
 }
 
-/// Calls loadCodeAssist and optionally onboardUser to get a project ID.
-async fn setup_code_assist(access_token: &str) -> Result<String> {
-    let load_body = json!({
-        "metadata": {
-            "ideType": "IDE_UNSPECIFIED",
-            "platform": "PLATFORM_UNSPECIFIED",
-            "pluginType": "GEMINI"
-        }
+fn project_from_env() -> Result<Option<String>> {
+    let project = ["GOOGLE_CLOUD_PROJECT", "GOOGLE_CLOUD_PROJECT_ID"]
+        .into_iter()
+        .find_map(|name| std::env::var(name).ok().filter(|value| !value.is_empty()));
+    validate_project_id(project)
+}
+
+fn validate_project_id(project: Option<String>) -> Result<Option<String>> {
+    match project {
+        Some(project) if project.chars().all(|c| c.is_ascii_digit()) => Err(anyhow!(
+            "GOOGLE_CLOUD_PROJECT must be the string project ID (e.g. my-project-123), \
+             not the numeric project number: {}",
+            project
+        )),
+        other => Ok(other),
+    }
+}
+
+fn client_metadata(project: Option<&str>) -> Value {
+    let mut metadata = json!({
+        "ideType": "IDE_UNSPECIFIED",
+        "platform": "PLATFORM_UNSPECIFIED",
+        "pluginType": "GEMINI"
     });
+    if let Some(project) = project {
+        metadata["duetProject"] = json!(project);
+    }
+    metadata
+}
 
-    let load_resp: LoadCodeAssistResponse = serde_json::from_value(
-        code_assist_request(access_token, "loadCodeAssist", &load_body).await?,
-    )?;
+fn load_code_assist_body(project: Option<&str>) -> Value {
+    let mut body = json!({ "metadata": client_metadata(project) });
+    if let Some(project) = project {
+        body["cloudaicompanionProject"] = json!(project);
+    }
+    body
+}
 
-    // If the user already has a project, use it
-    if let Some(ref project_id) = load_resp.cloudaicompanion_project {
-        if !project_id.is_empty() {
-            tracing::info!(
-                "Code Assist user already set up with project: {}",
-                project_id
-            );
-            return Ok(project_id.clone());
+fn onboard_user_body(tier_id: &str, project: Option<&str>) -> Value {
+    // The free tier uses a Google-managed project; sending one makes onboardUser fail.
+    let project = project.filter(|_| tier_id != FREE_TIER_ID);
+    let mut body = json!({
+        "tierId": tier_id,
+        "metadata": client_metadata(project)
+    });
+    if let Some(project) = project {
+        body["cloudaicompanionProject"] = json!(project);
+    }
+    body
+}
+
+fn project_required_error(load_resp: &LoadCodeAssistResponse) -> anyhow::Error {
+    let reasons: Vec<&str> = load_resp
+        .ineligible_tiers
+        .iter()
+        .flatten()
+        .filter_map(|tier| tier.reason_message.as_deref())
+        .collect();
+    if reasons.is_empty() {
+        anyhow!(
+            "This Google account requires a Google Cloud project for Gemini. \
+             Set GOOGLE_CLOUD_PROJECT to your project ID and try again."
+        )
+    } else {
+        anyhow!("{}", reasons.join(", "))
+    }
+}
+
+async fn poll_onboarding(access_token: &str, operation_name: &str) -> Result<OnboardUserResponse> {
+    for _ in 0..30 {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let operation: OnboardUserResponse =
+            serde_json::from_value(code_assist_get(access_token, operation_name).await?)?;
+        if operation.done.unwrap_or(false) {
+            return Ok(operation);
         }
     }
+    Err(anyhow!("Onboarding timed out after 60 seconds"))
+}
 
-    // User is already onboarded with a tier but no project returned at top-level
-    if let Some(ref tier) = load_resp.current_tier {
-        if tier.id.is_some() {
-            return Err(anyhow!(
-                "Your Google account is set up for Gemini but no project was returned. \
-                 Please verify your Gemini and Google Cloud project configuration and try again."
-            ));
-        }
+/// Calls loadCodeAssist and optionally onboardUser to get a project ID.
+///
+/// Accounts that Google does not assign a managed project to (for example
+/// Workspace or standard-tier accounts) must supply their own via GOOGLE_CLOUD_PROJECT.
+async fn setup_code_assist(access_token: &str) -> Result<String> {
+    let project = project_from_env()?;
+
+    let load_resp: LoadCodeAssistResponse = serde_json::from_value(
+        code_assist_request(
+            access_token,
+            "loadCodeAssist",
+            &load_code_assist_body(project.as_deref()),
+        )
+        .await?,
+    )?;
+
+    if let Some(project_id) = load_resp
+        .cloudaicompanion_project
+        .as_ref()
+        .filter(|project_id| !project_id.is_empty())
+    {
+        tracing::info!(
+            "Code Assist user already set up with project: {}",
+            project_id
+        );
+        return Ok(project_id.clone());
+    }
+
+    if load_resp
+        .current_tier
+        .as_ref()
+        .is_some_and(|tier| tier.id.is_some())
+    {
+        return project.ok_or_else(|| project_required_error(&load_resp));
     }
 
     // Need to onboard - determine tier
@@ -442,57 +531,31 @@ async fn setup_code_assist(access_token: &str) -> Result<String> {
                 .or_else(|| load_resp.allowed_tiers.as_ref().and_then(|t| t.first()))
                 .and_then(|t| t.id.clone())
         })
-        .unwrap_or_else(|| "free-tier".to_string());
+        .unwrap_or_else(|| FREE_TIER_ID.to_string());
 
     tracing::info!("Onboarding user with tier: {}", tier_id);
 
-    let onboard_body = json!({
-        "tierId": tier_id,
-        "metadata": {
-            "ideType": "IDE_UNSPECIFIED",
-            "platform": "PLATFORM_UNSPECIFIED",
-            "pluginType": "GEMINI"
-        }
-    });
-
-    let onboard_resp: OnboardUserResponse = serde_json::from_value(
-        code_assist_request(access_token, "onboardUser", &onboard_body).await?,
+    let mut operation: OnboardUserResponse = serde_json::from_value(
+        code_assist_request(
+            access_token,
+            "onboardUser",
+            &onboard_user_body(&tier_id, project.as_deref()),
+        )
+        .await?,
     )?;
 
-    // If the operation completed immediately
-    if onboard_resp.done.unwrap_or(false) {
-        if let Some(project_id) = onboard_resp
-            .response
-            .and_then(|r| r.cloudaicompanion_project)
-            .and_then(|p| p.id)
-        {
-            return Ok(project_id);
+    if !operation.done.unwrap_or(false) {
+        if let Some(operation_name) = operation.name.clone() {
+            operation = poll_onboarding(access_token, &operation_name).await?;
         }
     }
 
-    // Poll the long-running operation
-    if let Some(op_name) = onboard_resp.name {
-        for _ in 0..30 {
-            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            let op: OnboardUserResponse =
-                serde_json::from_value(code_assist_get(access_token, &op_name).await?)?;
-            if op.done.unwrap_or(false) {
-                if let Some(project_id) = op
-                    .response
-                    .and_then(|r| r.cloudaicompanion_project)
-                    .and_then(|p| p.id)
-                {
-                    return Ok(project_id);
-                }
-                return Err(anyhow!("Onboarding completed but no project ID returned"));
-            }
-        }
-        return Err(anyhow!("Onboarding timed out after 60 seconds"));
-    }
-
-    Err(anyhow!(
-        "Onboarding failed: no operation name or project ID returned"
-    ))
+    operation
+        .response
+        .and_then(|response| response.cloudaicompanion_project)
+        .and_then(|project| project.id)
+        .or(project)
+        .ok_or_else(|| project_required_error(&load_resp))
 }
 
 // ---------------------------------------------------------------------------
@@ -1059,6 +1122,100 @@ mod tests {
         let s2 = generate_state();
         assert!(!s1.is_empty());
         assert_ne!(s1, s2);
+    }
+
+    #[test]
+    fn test_validate_project_id() {
+        assert_eq!(validate_project_id(None).unwrap(), None);
+        assert_eq!(
+            validate_project_id(Some("my-project-123".to_string())).unwrap(),
+            Some("my-project-123".to_string())
+        );
+        let err = validate_project_id(Some("123456789".to_string())).unwrap_err();
+        assert!(err.to_string().contains("numeric project number"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_project_from_env() {
+        let _guard = env_lock::lock_env([
+            ("GOOGLE_CLOUD_PROJECT", Some("primary-project")),
+            ("GOOGLE_CLOUD_PROJECT_ID", Some("fallback-project")),
+        ]);
+        assert_eq!(
+            project_from_env().unwrap(),
+            Some("primary-project".to_string())
+        );
+        drop(_guard);
+
+        let _guard = env_lock::lock_env([
+            ("GOOGLE_CLOUD_PROJECT", Some("")),
+            ("GOOGLE_CLOUD_PROJECT_ID", Some("fallback-project")),
+        ]);
+        assert_eq!(
+            project_from_env().unwrap(),
+            Some("fallback-project".to_string())
+        );
+        drop(_guard);
+
+        let _guard = env_lock::lock_env([
+            ("GOOGLE_CLOUD_PROJECT", None),
+            ("GOOGLE_CLOUD_PROJECT_ID", None),
+        ]);
+        assert_eq!(project_from_env().unwrap(), None);
+    }
+
+    #[test]
+    fn test_load_code_assist_body() {
+        let without = load_code_assist_body(None);
+        assert!(without.get("cloudaicompanionProject").is_none());
+        assert!(without["metadata"].get("duetProject").is_none());
+        assert_eq!(without["metadata"]["pluginType"], "GEMINI");
+
+        let with = load_code_assist_body(Some("my-project"));
+        assert_eq!(with["cloudaicompanionProject"], "my-project");
+        assert_eq!(with["metadata"]["duetProject"], "my-project");
+    }
+
+    #[test]
+    fn test_onboard_user_body() {
+        let standard = onboard_user_body("standard-tier", Some("my-project"));
+        assert_eq!(standard["tierId"], "standard-tier");
+        assert_eq!(standard["cloudaicompanionProject"], "my-project");
+        assert_eq!(standard["metadata"]["duetProject"], "my-project");
+
+        let standard_without_project = onboard_user_body("standard-tier", None);
+        assert!(standard_without_project
+            .get("cloudaicompanionProject")
+            .is_none());
+
+        let free = onboard_user_body(FREE_TIER_ID, Some("my-project"));
+        assert_eq!(free["tierId"], FREE_TIER_ID);
+        assert!(free.get("cloudaicompanionProject").is_none());
+        assert!(free["metadata"].get("duetProject").is_none());
+    }
+
+    #[test]
+    fn test_project_required_error() {
+        let no_reasons: LoadCodeAssistResponse = serde_json::from_value(json!({
+            "allowedTiers": [{"id": "standard-tier", "isDefault": true}]
+        }))
+        .unwrap();
+        assert!(project_required_error(&no_reasons)
+            .to_string()
+            .contains("GOOGLE_CLOUD_PROJECT"));
+
+        let with_reasons: LoadCodeAssistResponse = serde_json::from_value(json!({
+            "ineligibleTiers": [
+                {"reasonMessage": "first reason"},
+                {"reasonMessage": "second reason"}
+            ]
+        }))
+        .unwrap();
+        assert_eq!(
+            project_required_error(&with_reasons).to_string(),
+            "first reason, second reason"
+        );
     }
 
     #[test]
